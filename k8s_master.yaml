@@ -1,0 +1,207 @@
+---
+- name: Setup Kubernetes on Ubuntu
+  hosts: k8s_servers
+  become: yes
+  tasks:
+    - name: Download kubectl
+      get_url:
+        url: https://storage.googleapis.com/kubernetes-release/release/v1.21.2/bin/linux/amd64/kubectl
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+
+    - name: Download kubelet
+      get_url:
+        url: https://storage.googleapis.com/kubernetes-release/release/v1.21.2/bin/linux/amd64/kubelet
+        dest: /usr/local/bin/kubelet
+        mode: '0755'
+
+    - name: Download kubeadm
+      get_url:
+        url: https://storage.googleapis.com/kubernetes-release/release/v1.21.2/bin/linux/amd64/kubeadm
+        dest: /usr/local/bin/kubeadm
+        mode: '0755'
+
+    - name: Disable swap and update fstab
+      command: swapoff -a
+      register: swapoff_result
+      ignore_errors: yes
+
+    - name: Remove swap entry from fstab
+      command: sed -i '/swap/d' /etc/fstab
+      when: swapoff_result.rc == 0
+
+    - name: Load br_netfilter module
+      command: modprobe br_netfilter
+
+    - name: Set sysctl parameters
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: 1 }
+        - { name: 'net.ipv4.ip_forward', value: 1 }
+
+    - name: Append sysctl settings to sysctl.conf
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: "{{ item }}"
+        state: present
+      loop:
+        - "net.bridge.bridge-nf-call-iptables=1"
+        - "net.ipv4.ip_forward=1"
+
+    - name: Create kubelet service file
+      copy:
+        dest: /etc/systemd/system/kubelet.service
+        content: |
+          [Unit]
+          Description=Kubelet
+          After=network.target
+
+          [Service]
+          Restart=always
+          StartLimitInterval=0
+          Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+          Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+          EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+          EnvironmentFile=-/etc/default/kubelet
+          ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Install required packages
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+        keyring: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        state: present
+
+    - name: Update apt package index
+      apt:
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name: docker-ce
+        state: latest
+
+    - name: Update apt package index
+      apt:
+        update_cache: yes
+
+    - name: Enable and restart Docker
+      service:
+        name: docker
+        enabled: yes
+        state: restarted
+
+    - name: Install additional packages
+      apt:
+        name:
+          - ethtool
+          - socat
+          - conntrack
+        state: present
+
+    - name: Enable kubelet service
+      systemd:
+        name: kubelet
+        enabled: yes
+
+    - name: Initialize Kubernetes
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16 --upload-certs
+      become: true
+
+- name: Copy kubeconfig
+  hosts: all
+  become: true
+  vars:
+    master_ip: "<IP_ADDRESS>"  # Замените на IP-адрес вашего мастер-узла
+    ingress_controller_url: "https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml"
+  tasks:
+    - name: Create .kube directory
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+        mode: '0755'
+
+    - name: Copy admin.conf to kube config
+      command: cp -i /etc/kubernetes/admin.conf {{ ansible_env.HOME }}/.kube/config
+      args:
+        creates: "{{ ansible_env.HOME }}/.kube/config"
+
+    - name: Change ownership of kube config
+      shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
+      args:
+        executable: /bin/bash
+
+    - name: Extract the token for joining the cluster
+      command: "kubeadm token list | awk 'NR>1 {print $1}'"
+      register: token_output
+
+    - name: Extract the discovery token CA cert hash
+      shell: "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl sha256 | awk '{print $2}'"
+      args:
+        executable: /bin/bash
+      register: hash_output
+
+    - name: Output the token and CA hash
+      debug:
+        msg:
+          - "Join Token: {{ token_output.stdout }}"
+          - "Discovery Token CA Cert Hash: sha256:{{ hash_output.stdout }}"
+
+    - name: Apply Flannel CNI
+      command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      become: no
+
+    - name: Determine system architecture
+      shell: |
+        ARCH=$(uname -m)
+          case $ARCH in
+            armv7*) ARCH="arm";;
+            aarch64) ARCH="arm64";;
+            x86_64) ARCH="amd64";;
+          esac
+        echo $ARCH
+      register: arch_output
+
+    - name: Create directory for CNI plugins
+      file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+
+    - name: Download CNI plugins
+      get_url:
+        url: "https://github.com/containernetworking/plugins/releases/download/>
+        dest: /tmp/cni-plugins.tgz
+
+    - name: Extract CNI plugins
+      unarchive:
+        src: /tmp/cni-plugins.tgz
+        dest: /opt/cni/bin
+        remote_src: yes
+
+ #   - name: Join the Kubernetes cluster
+ #     shell: "kubeadm join {{ master_ip }}:6443 --token {{ token_output.stdout }} --discovery-token-ca-cert-hash sha256:{{ hash_output.stdout }}"
+ #     args:
+ #       executable: /bin/bash
+
